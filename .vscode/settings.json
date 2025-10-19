@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "wayland-server-core.h": "c",
+        "numbers": "c"
+    }
+}

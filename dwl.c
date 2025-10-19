@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/libinput.h>
@@ -386,9 +387,11 @@ static Monitor *xytomon(double x, double y);
 static void xytonode(double x, double y, struct wlr_surface **psurface,
 		Client **pc, LayerSurface **pl, double *nx, double *ny);
 static void zoom(const Arg *arg);
-
+static void sigstatusbar(const Arg *arg);
 /* variables */
+static bool statusstate = 0; /* 0 - inactive, 1 - active */
 static pid_t child_pid = -1;
+static pid_t getstatusbarpid();
 static int locked;
 static void *exclusive_focus;
 static struct wl_display *dpy;
@@ -442,6 +445,12 @@ static struct wl_list mons;
 static Monitor *selmon;
 
 static char stext[256];
+static int statusw;
+static int statussig;
+static pid_t statuspid = -1;
+
+
+
 static struct wl_event_source *status_event_source;
 
 static const struct wlr_buffer_impl buffer_impl = {
@@ -755,6 +764,7 @@ buttonpress(struct wl_listener *listener, void *data)
 	Arg arg = {0};
 	Client *c;
 	const Button *b;
+	char *text, *s, ch;
 
 	wlr_idle_notifier_v1_notify_activity(idle_notifier, seat);
 
@@ -782,11 +792,27 @@ buttonpress(struct wl_listener *listener, void *data)
 				arg.ui = 1 << i;
 			} else if (cx < x + TEXTW(selmon, selmon->ltsymbol))
 				click = ClkLtSymbol;
-			else if (cx > selmon->b.width - (TEXTW(selmon, stext) - selmon->lrpad + 2)) {
+			else if (cx > selmon->b.width - statusw)
+			{
+				x = selmon->b.width - statusw;
 				click = ClkStatus;
+				statussig = 1;
+				for (text = s = stext; *s && x <= cx; s++){
+					if ((unsigned char)(*s) < ' ') {
+						ch = *s;
+						*s = '\0';
+						x += TEXTW(selmon, text) - selmon->lrpad;
+						*s = ch;
+						text = s + 1;
+						if (x >= cx)
+							break;
+						statussig = ch;
+					}
+				}
 			} else
 				click = ClkTitle;
-		}
+		 } 
+				
 
 		/* Change focus if the button was _pressed_ over a client */
 		xytonode(cursor->x, cursor->y, NULL, &c, NULL, NULL, NULL);
@@ -1583,9 +1609,26 @@ drawbar(Monitor *m)
 
 	/* draw status first so it can be overdrawn by tags later */
 	if (m == selmon) { /* status is only drawn on selected monitor */
+		char *text, *s, ch;
 		drwl_setscheme(m->drw, colors[SchemeNorm]);
-		tw = TEXTW(m, stext) - m->lrpad + 2; /* 2px right padding */
-		drwl_text(m->drw, m->b.width - tw, 0, tw, m->b.height, 0, stext, 0);
+		// tw = TEXTW(m, stext) - m->lrpad + 2; /* 2px right padding */
+		// drwl_text(m->drw, m->b.width - tw, 0, tw, m->b.height, 0, stext, 0);
+
+		x = 0;
+		for (text = s = stext; *s; s++) {
+			if ((unsigned char)(*s) < ' ') {
+				ch = *s;
+				*s = '\0';
+				tw = TEXTW(m, text) - m->lrpad;
+				drwl_text(m->drw, m->b.width - statusw + x, 0, tw, m->b.height, 0, text, 0);
+				x += tw;
+				*s = ch;
+				text = s + 1;
+			}
+		}
+		tw = TEXTW(m, text) - m->lrpad + 2;
+		drwl_text(m->drw, m->b.width - statusw + x, 0, tw, m->b.height, 0, text, 0);
+		tw = statusw;
 	}
 
 	wl_list_for_each(c, &clients, link) {
@@ -2635,6 +2678,44 @@ setsel(struct wl_listener *listener, void *data)
 	wlr_seat_set_selection(seat, event->source, event->serial);
 }
 
+
+
+ 
+pid_t
+getstatusbarpid()
+{
+	char buf[32], *str = buf, *c;
+	FILE *fp;
+
+	if (statuspid > 0) {
+		snprintf(buf, sizeof(buf), "/proc/%u/cmdline", statuspid);
+		if ((fp = fopen(buf, "r"))) {
+			fgets(buf, sizeof(buf), fp);
+			while ((c = strchr(str, '/')))
+				str = c + 1;
+			fclose(fp);
+			if (!strcmp(str, STATUSBAR))
+				return statuspid;
+		}
+	}
+	if (!(fp = popen("pidof -s "STATUSBAR, "r")))
+		return -1;
+	fgets(buf, sizeof(buf), fp);
+	pclose(fp);
+	return strtol(buf, NULL, 10);
+}
+void
+sigstatusbar(const Arg *arg)
+{
+	union sigval sv;
+	if (!statussig)
+		return;
+	sv.sival_int = arg->i;
+	if ((statuspid = getstatusbarpid()) <= 0)
+		return;
+	sigqueue(statuspid, SIGRTMIN+statussig, sv);
+}
+
 void
 setup(void)
 {
@@ -2896,21 +2977,28 @@ statusin(int fd, unsigned int mask, void *data)
 
 	if (mask & WL_EVENT_ERROR)
 		die("status in event error");
-	if (mask & WL_EVENT_HANGUP)
+	if (mask & WL_EVENT_HANGUP) {
 		wl_event_source_remove(status_event_source);
-
+		return 0;
+	}
+		
 	n = read(fd, status, sizeof(status) - 1);
 	if (n < 0 && errno != EWOULDBLOCK)
 		die("read:");
 
+	if (n <= 0)
+		return 1; // no data, keep watching
 	status[n] = '\0';
 	status[strcspn(status, "\n")] = '\0';
-
-	strncpy(stext, status, sizeof(stext));
+	strncpy(stext, status, sizeof(stext) - 1);
+	stext[sizeof(stext) - 1] = '\0';
+	statusstate = 1;
 	drawbars();
 
-	return 0;
+	return 1;
 }
+
+
 
 void
 tag(const Arg *arg)
@@ -3164,8 +3252,27 @@ updatemons(struct wl_listener *listener, void *data)
 		}
 	}
 
-	if (stext[0] == '\0')
-		strncpy(stext, "dwl-"VERSION, sizeof(stext));
+	if (stext[0] == '\0') {
+		strncpy(stext, "dwl-" VERSION " ;(", sizeof(stext));
+		statusw = TEXTW(selmon, stext) - selmon->lrpad + 2;
+	}else{
+		char *text, *s, ch;
+
+		statusw = 0;
+		for (text = s = stext; *s; s++)
+		{
+			if ((unsigned char)(*s) < ' ')
+			{
+				ch = *s;
+				*s = '\0';
+				statusw += TEXTW(selmon, text) - selmon->lrpad;
+				*s = ch;
+				text = s + 1;
+			}
+		}
+		statusw += TEXTW(selmon, text) - selmon->lrpad + 2;
+	}
+
 	wl_list_for_each(m, &mons, link) {
 		updatebar(m);
 		drawbar(m);

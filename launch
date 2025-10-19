@@ -1,0 +1,6 @@
+#!/bin/sh
+while true; do
+    cat ./dwl-bar-0
+    printf '\0'
+    sleep 0.1
+done | ./dwl
